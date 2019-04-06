@@ -3,6 +3,7 @@ import time
 
 import gtimer as gt
 import numpy as np
+import torch
 
 from rlkit.core import logger
 from rlkit.data_management.env_replay_buffer import MultiTaskReplayBuffer
@@ -11,6 +12,8 @@ from rlkit.data_management.path_builder import PathBuilder
 from rlkit.policies.base import ExplorationPolicy
 from rlkit.samplers.in_place import InPlacePathSampler
 
+import visdom
+vis = visdom.Visdom(port=8095, env='sac')
 
 class MetaRLAlgorithm(metaclass=abc.ABCMeta):
     def __init__(
@@ -40,6 +43,7 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             save_replay_buffer=False,
             save_algorithm=False,
             save_environment=False,
+            obs_emb_dim=0
     ):
         """
         Base class for Meta RL Algorithms
@@ -108,17 +112,21 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
                 self.replay_buffer_size,
                 env,
                 self.train_tasks,
+                state_dim=obs_emb_dim
             )
 
         self.enc_replay_buffer = MultiTaskReplayBuffer(
                 self.replay_buffer_size,
                 env,
                 self.train_tasks,
+                state_dim=obs_emb_dim
         )
         self.eval_enc_replay_buffer = MultiTaskReplayBuffer(
             self.replay_buffer_size,
             env,
-            self.eval_tasks
+            self.eval_tasks,
+            state_dim=obs_emb_dim
+
         )
 
         self._n_env_steps_total = 0
@@ -170,6 +178,7 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
                 print('collecting initial pool of data for train and eval')
                 # temp for evaluating
                 for idx in self.train_tasks:
+                    print('train task', idx)
                     self.task_idx = idx
                     self.env.reset_task(idx)
                     self.collect_data_sampling_from_prior(num_samples=self.max_path_length * 10,
@@ -311,27 +320,37 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
     # TODO: since switching tasks now resets the environment, we are not correctly handling episodes terminating
     # correctly. We also aren't using the episodes anywhere, but we should probably change this to make it gather paths
     # until we have more samples than num_samples, to make sure every episode cleanly terminates when intended.
+
     def collect_data(self, agent, num_samples=1, eval_task=False, add_to_enc_buffer=True):
         '''
         collect data from current env in batch mode
         with given policy
         '''
+
+        images = []
         for _ in range(num_samples):
             action, agent_info = self._get_action_and_info(agent, self.train_obs)
             if self.render:
                 self.env.render()
+            
             next_ob, raw_reward, terminal, env_info = (
                 self.env.step(action)
             )
+            images.append(next_ob)
+            
             reward = raw_reward
             terminal = np.array([terminal])
             reward = np.array([reward])
             self._handle_step(
                 self.task_idx,
-                self.train_obs,
+                np.concatenate(
+                    [self.train_obs.reshape(1, -1), agent_info['obs_emb']], axis=-1
+                ),
                 action,
                 reward,
-                next_ob,
+                np.concatenate(
+                    [next_ob.reshape(1, -1), torch.zeros(agent_info['obs_emb'].shape)], axis=-1
+                ),
                 terminal,
                 eval_task=eval_task,
                 add_to_enc_buffer=add_to_enc_buffer,
@@ -344,6 +363,9 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             else:
                 self.train_obs = next_ob
 
+        vis.images(np.stack(images))
+        # vis.video(np.stack(images))
+        
         if not eval_task:
             self._n_env_steps_total += num_samples
             gt.stamp('sample')
@@ -436,7 +458,10 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         logger.pop_prefix()
 
     def _start_new_rollout(self):
-        return self.env.reset()
+        ret = self.env.reset()
+        if isinstance(ret, tuple):
+            ret = ret[0]
+        return ret
 
     # not used
     def _handle_path(self, path):
@@ -463,10 +488,10 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             path["env_infos"],
         ):
             self._handle_step(
-                ob,
+                ob.reshape(-1),
                 action,
                 reward,
-                next_ob,
+                next_ob.reshape(-1),
                 terminal,
                 agent_info=agent_info,
                 env_info=env_info,

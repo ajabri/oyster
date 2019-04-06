@@ -91,6 +91,11 @@ class ProtoSoftActorCritic(MetaTorchRLAlgorithm):
             lr=context_lr,
         )
 
+        self.cnn_optimizer = optimizer_class(
+            self.policy.cnn_enc.parameters(),
+            lr=context_lr,
+        )
+
     def sample_data(self, indices, encoder=False):
         # sample from replay buffer for each task
         # TODO(KR) this is ugly af
@@ -123,7 +128,9 @@ class ProtoSoftActorCritic(MetaTorchRLAlgorithm):
         # assume obs and rewards are (task, batch, feat)
         if self.sparse_rewards:
             rewards = ptu.sparsify_rewards(rewards)
-        task_data = torch.cat([obs, act, rewards], dim=2)
+        obs_dim = np.prod(self.env.observation_space.shape)
+
+        task_data = torch.cat([obs[:, :, obs_dim:], act, rewards], dim=2)
         return task_data
 
     def _do_training(self, indices):
@@ -135,12 +142,15 @@ class ProtoSoftActorCritic(MetaTorchRLAlgorithm):
         # zero out context and hidden encoder state
         self.policy.clear_z(num_tasks=len(indices))
 
+        import time
         for i in range(num_updates):
+            t0 = time.time()
             # TODO(KR) argh so ugly
             mini_batch = [x[:, i * mb_size: i * mb_size + mb_size, :] for x in batch]
             obs_enc, act_enc, rewards_enc, _, _ = mini_batch
             self._take_step(indices, obs_enc, act_enc, rewards_enc)
 
+            print(time.time() - t0, 'TIME')
             # stop backprop
             self.policy.detach_z()
 
@@ -151,6 +161,8 @@ class ProtoSoftActorCritic(MetaTorchRLAlgorithm):
         # data is (task, batch, feat)
         obs, actions, rewards, next_obs, terms = self.sample_data(indices)
         enc_data = self.prepare_encoder_data(obs_enc, act_enc, rewards_enc)
+
+        self.cnn_optimizer.zero_grad()
 
         # run inference in networks
         q1_pred, q2_pred, v_pred, policy_outputs, target_v_values, task_z = self.policy(obs, actions, next_obs, enc_data, obs_enc, act_enc)
@@ -167,12 +179,14 @@ class ProtoSoftActorCritic(MetaTorchRLAlgorithm):
         self.qf1_optimizer.zero_grad()
         self.qf2_optimizer.zero_grad()
         rewards_flat = rewards.view(self.batch_size * num_tasks, -1)
+
         # scale rewards for Bellman update
         rewards_flat = rewards_flat * self.reward_scale
         terms_flat = terms.view(self.batch_size * num_tasks, -1)
         q_target = rewards_flat + (1. - terms_flat) * self.discount * target_v_values
         qf_loss = torch.mean((q1_pred - q_target) ** 2) + torch.mean((q2_pred - q_target) ** 2)
-        qf_loss.backward()
+        qf_loss.backward(retain_graph=True)
+        
         self.qf1_optimizer.step()
         self.qf2_optimizer.step()
         self.context_optimizer.step()
@@ -184,7 +198,7 @@ class ProtoSoftActorCritic(MetaTorchRLAlgorithm):
         v_target = min_q_new_actions - log_pi
         vf_loss = self.vf_criterion(v_pred, v_target.detach())
         self.vf_optimizer.zero_grad()
-        vf_loss.backward()
+        vf_loss.backward(retain_graph=True)
         self.vf_optimizer.step()
         self.policy._update_target_network()
 
@@ -213,7 +227,8 @@ class ProtoSoftActorCritic(MetaTorchRLAlgorithm):
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
         self.policy_optimizer.step()
-
+        self.cnn_optimizer.step()
+        
         # save some statistics for eval
         if self.eval_statistics is None:
             # eval should set this to None.

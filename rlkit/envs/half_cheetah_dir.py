@@ -53,6 +53,7 @@ class HalfCheetahDirEnv(HalfCheetahEnv):
 
     def reset_task(self, idx):
         self._task = self.tasks[idx]
+        print(self._task)
         self._goal_dir = self._task['direction']
         self._goal = self._goal_dir
         self.reset()

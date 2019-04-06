@@ -37,7 +37,7 @@ class ProtoAgent(nn.Module):
     ):
         super().__init__()
         self.latent_dim = latent_dim
-        self.task_enc, self.policy, self.qf1, self.qf2, self.vf = nets
+        self.task_enc, self.cnn_enc, self.policy, self.qf1, self.qf2, self.vf = nets
         self.target_vf = self.vf.copy()
         self.recurrent = kwargs['recurrent']
         self.reparam = kwargs['reparameterize']
@@ -46,6 +46,7 @@ class ProtoAgent(nn.Module):
         self.reward_scale = kwargs['reward_scale']
         self.sparse_rewards = kwargs['sparse_rewards']
         self.det_z = False
+        self.obs_emb_dim = kwargs['obs_emb_dim']
 
         # initialize task embedding to zero
         # (task, latent dim)
@@ -143,8 +144,17 @@ class ProtoAgent(nn.Module):
         ''' sample action from the policy, conditioned on the task embedding '''
         z = self.z
         obs = ptu.from_numpy(obs[None])
-        in_ = torch.cat([obs, z], dim=1)
-        return self.policy.get_action(in_, deterministic=deterministic)
+
+        obs_emb = self.cnn_enc(obs.view(obs.shape[0], -1))
+        # import pdb; pdb.set_trace()
+
+        # can eventually modulate the cnn encoder with the z embedding as well?
+        in_ = torch.cat([obs_emb, z], dim=1)
+        action, agent_info = self.policy.get_action(in_, deterministic=deterministic)
+        action = action.astype(np.int)[0]
+        agent_info['obs_emb'] = obs_emb.detach().cpu().numpy()
+
+        return (action, agent_info)
 
     def set_num_steps_total(self, n):
         self.policy.set_num_steps_total(n)
@@ -153,6 +163,7 @@ class ProtoAgent(nn.Module):
         ptu.soft_update_from_to(self.vf, self.target_vf, self.tau)
 
     def forward(self, obs, actions, next_obs, enc_data, obs_enc, act_enc):
+        # import pdb; pdb.set_trace()
         self.set_z(enc_data)
         return self.infer(obs, actions, next_obs, obs_enc, act_enc)
 
@@ -172,11 +183,19 @@ class ProtoAgent(nn.Module):
         task_z = [z.repeat(b, 1) for z in task_z]
         task_z = torch.cat(task_z, dim=0)
 
+        obs_emb = obs[:, :-self.obs_emb_dim]
+        obs_emb = self.cnn_enc(obs_emb)
+
+        next_obs_emb = obs[:, :-self.obs_emb_dim]
+        next_obs_emb = self.cnn_enc(next_obs_emb)
+
+        obs, next_obs = obs_emb, next_obs_emb
+
         # Q and V networks
         # encoder will only get gradients from Q nets
         q1 = self.qf1(obs, actions, task_z)
         q2 = self.qf2(obs, actions, task_z)
-        v = self.vf(obs, task_z.detach())
+        v = self.vf(obs.detach(), task_z.detach())
 
         # run policy, get log probs and new actions
         in_ = torch.cat([obs, task_z.detach()], dim=1)
@@ -191,6 +210,7 @@ class ProtoAgent(nn.Module):
     def min_q(self, obs, actions, task_z):
         t, b, _ = obs.size()
         obs = obs.view(t * b, -1)
+        obs = obs[:, -self.obs_emb_dim:]
 
         q1 = self.qf1(obs, actions, task_z.detach())
         q2 = self.qf2(obs, actions, task_z.detach())

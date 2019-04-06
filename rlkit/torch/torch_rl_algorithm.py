@@ -132,9 +132,10 @@ class MetaTorchRLAlgorithm(MetaRLAlgorithm, metaclass=abc.ABCMeta):
         paths = []
         for _ in range(num_evals):
             paths += self.obtain_eval_paths(idx, eval_task=eval_task, deterministic=True)
-        goal = self.env._goal
-        for path in paths:
-            path['goal'] = goal # goal
+        
+        # goal = self.env._goal
+        # for path in paths:
+        #     path['goal'] = goal # goal
 
         # save the paths for visualization, only useful for point mass
         if self.dump_eval_paths:
@@ -176,6 +177,7 @@ class MetaTorchRLAlgorithm(MetaRLAlgorithm, metaclass=abc.ABCMeta):
         # This is calculating the embedding online, because every iteration
         # we clear the encoding buffer for the test tasks.
         for idx in self.eval_tasks:
+            print('eval task', idx)
             self.task_idx = idx
             self.env.reset_task(idx)
 
