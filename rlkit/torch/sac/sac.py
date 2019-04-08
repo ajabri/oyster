@@ -150,7 +150,7 @@ class ProtoSoftActorCritic(MetaTorchRLAlgorithm):
             obs_enc, act_enc, rewards_enc, _, _ = mini_batch
             self._take_step(indices, obs_enc, act_enc, rewards_enc)
 
-            print(time.time() - t0, 'TIME')
+            # print(time.time() - t0, 'TIME')
             # stop backprop
             self.policy.detach_z()
 
@@ -165,8 +165,9 @@ class ProtoSoftActorCritic(MetaTorchRLAlgorithm):
         self.cnn_optimizer.zero_grad()
 
         # run inference in networks
-        q1_pred, q2_pred, v_pred, policy_outputs, target_v_values, task_z = self.policy(obs, actions, next_obs, enc_data, obs_enc, act_enc)
-        new_actions, policy_mean, policy_log_std, log_pi = policy_outputs[:4]
+        q1_pred, q1_next_pred, q2_next_pred, policy_outputs, task_z = self.policy(obs, actions, next_obs, enc_data, obs_enc, act_enc)
+        # new_actions, policy_mean, policy_log_std, log_pi = policy_outputs[:4]
+        new_actions = policy_outputs
 
         # KL constraint on z if probabilistic
         self.context_optimizer.zero_grad()
@@ -176,59 +177,47 @@ class ProtoSoftActorCritic(MetaTorchRLAlgorithm):
             kl_loss.backward(retain_graph=True)
 
         # qf and encoder update (note encoder does not get grads from policy or vf)
-        self.qf1_optimizer.zero_grad()
-        self.qf2_optimizer.zero_grad()
         rewards_flat = rewards.view(self.batch_size * num_tasks, -1)
 
         # scale rewards for Bellman update
         rewards_flat = rewards_flat * self.reward_scale
         terms_flat = terms.view(self.batch_size * num_tasks, -1)
-        q_target = rewards_flat + (1. - terms_flat) * self.discount * target_v_values
-        qf_loss = torch.mean((q1_pred - q_target) ** 2) + torch.mean((q2_pred - q_target) ** 2)
-        qf_loss.backward(retain_graph=True)
-        
+        actions = actions.view(self.batch_size * num_tasks, -1)
+
+        best_action_idxs = q1_next_pred.max(
+            1, keepdim=True
+        )[1]
+        target_q_values = q2_next_pred.gather(
+            1, best_action_idxs
+        ).detach()
+
+        y_target = rewards_flat + (1. - terms_flat) * self.discount * target_q_values
+        y_target = y_target.detach()
+
+        # actions is a one-hot vector
+        y_pred = torch.sum(q1_pred * actions, dim=1, keepdim=True)
+        qf_loss = self.qf_criterion(y_pred, y_target)
+
+        """
+        Update networks
+        """
+        self.qf1_optimizer.zero_grad()
+        self.cnn_optimizer.zero_grad()      
+        qf_loss.backward()
+      
         self.qf1_optimizer.step()
-        self.qf2_optimizer.step()
+        self.cnn_optimizer.step()  
         self.context_optimizer.step()
 
-        # compute min Q on the new actions
-        min_q_new_actions = self.policy.min_q(obs, new_actions, task_z)
 
-        # vf update
-        v_target = min_q_new_actions - log_pi
-        vf_loss = self.vf_criterion(v_pred, v_target.detach())
-        self.vf_optimizer.zero_grad()
-        vf_loss.backward(retain_graph=True)
-        self.vf_optimizer.step()
-        self.policy._update_target_network()
-
-        # policy update
-        # n.b. policy update includes dQ/da
-        log_policy_target = min_q_new_actions
-
-        if self.reparameterize:
-            policy_loss = (
-                    log_pi - log_policy_target
-            ).mean()
-        else:
-            policy_loss = (
-                log_pi * (log_pi - log_policy_target + v_pred).detach()
-            ).mean()
-
-        mean_reg_loss = self.policy_mean_reg_weight * (policy_mean**2).mean()
-        std_reg_loss = self.policy_std_reg_weight * (policy_log_std**2).mean()
-        pre_tanh_value = policy_outputs[-1]
-        pre_activation_reg_loss = self.policy_pre_activation_weight * (
-            (pre_tanh_value**2).sum(dim=1).mean()
+        """
+        Soft target network updates
+        """
+        # if self._n_train_steps_total % self.target_update_period == 0:
+        ptu.soft_update_from_to(
+            self.policy.qf1, self.policy.qf2, self.soft_target_tau
         )
-        policy_reg_loss = mean_reg_loss + std_reg_loss + pre_activation_reg_loss
-        policy_loss = policy_loss + policy_reg_loss
 
-        self.policy_optimizer.zero_grad()
-        policy_loss.backward()
-        self.policy_optimizer.step()
-        self.cnn_optimizer.step()
-        
         # save some statistics for eval
         if self.eval_statistics is None:
             # eval should set this to None.
@@ -245,30 +234,30 @@ class ProtoSoftActorCritic(MetaTorchRLAlgorithm):
                 self.eval_statistics['KL Loss'] = ptu.get_numpy(kl_loss)
 
             self.eval_statistics['QF Loss'] = np.mean(ptu.get_numpy(qf_loss))
-            self.eval_statistics['VF Loss'] = np.mean(ptu.get_numpy(vf_loss))
-            self.eval_statistics['Policy Loss'] = np.mean(ptu.get_numpy(
-                policy_loss
-            ))
+            # self.eval_statistics['VF Loss'] = np.mean(ptu.get_numpy(vf_loss))
+            # self.eval_statistics['Policy Loss'] = np.mean(ptu.get_numpy(
+            #     policy_loss
+            # ))
             self.eval_statistics.update(create_stats_ordered_dict(
                 'Q Predictions',
                 ptu.get_numpy(q1_pred),
             ))
-            self.eval_statistics.update(create_stats_ordered_dict(
-                'V Predictions',
-                ptu.get_numpy(v_pred),
-            ))
-            self.eval_statistics.update(create_stats_ordered_dict(
-                'Log Pis',
-                ptu.get_numpy(log_pi),
-            ))
-            self.eval_statistics.update(create_stats_ordered_dict(
-                'Policy mu',
-                ptu.get_numpy(policy_mean),
-            ))
-            self.eval_statistics.update(create_stats_ordered_dict(
-                'Policy log std',
-                ptu.get_numpy(policy_log_std),
-            ))
+            # self.eval_statistics.update(create_stats_ordered_dict(
+            #     'V Predictions',
+            #     ptu.get_numpy(v_pred),
+            # ))
+            # self.eval_statistics.update(create_stats_ordered_dict(
+            #     'Log Pis',
+            #     ptu.get_numpy(log_pi),
+            # ))
+            # self.eval_statistics.update(create_stats_ordered_dict(
+            #     'Policy mu',
+            #     ptu.get_numpy(policy_mean),
+            # ))
+            # self.eval_statistics.update(create_stats_ordered_dict(
+            #     'Policy log std',
+            #     ptu.get_numpy(policy_log_std),
+            # ))
 
     def sample_z_from_prior(self):
         self.policy.clear_z()

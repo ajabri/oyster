@@ -14,7 +14,7 @@ from rlkit.samplers.in_place import InPlacePathSampler
 
 import visdom
 vis = visdom.Visdom(port=8095, env='sac')
-
+vis.close()
 class MetaRLAlgorithm(metaclass=abc.ABCMeta):
     def __init__(
             self,
@@ -34,7 +34,7 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             embedding_mini_batch_size=1024,
             max_path_length=1000,
             discount=0.99,
-            replay_buffer_size=1000000,
+            replay_buffer_size=1000000, #1000000,
             reward_scale=1,
             train_embedding_source='posterior_only',
             eval_embedding_source='initial_pool',
@@ -87,7 +87,7 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         self.embedding_mini_batch_size = embedding_mini_batch_size
         self.max_path_length = max_path_length
         self.discount = discount
-        self.replay_buffer_size = replay_buffer_size
+        self.replay_buffer_size = min(int(replay_buffer_size/(len(train_tasks)+len(eval_tasks))), 10000)
         self.reward_scale = reward_scale
         self.train_embedding_source = train_embedding_source
         self.eval_embedding_source = eval_embedding_source # TODO: add options for computing embeddings on train tasks too
@@ -215,13 +215,17 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
                     # sample data from posterior to train RL algorithm
                     self.enc_replay_buffer.task_buffers[idx].clear()
                     # resamples using current policy, conditioned on prior
+
                     self.collect_data_sampling_from_prior(num_samples=self.num_steps_per_task,
                                                           resample_z_every_n=self.max_path_length,
                                                           add_to_enc_buffer=True)
 
+                    self.env.reset_task(idx)
+
                     self.collect_data_from_task_posterior(idx=idx,
                                                           num_samples=self.num_steps_per_task,
-                                                          add_to_enc_buffer=False)
+                                                          add_to_enc_buffer=False,
+                                                          viz=True)
                 elif self.train_embedding_source == 'online_on_policy_trajectories':
                     # sample from prior, then sample more from the posterior
                     # embeddings computed from both prior and posterior data
@@ -288,12 +292,12 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
                 num_samples -= resample_z_every_n
 
     def collect_data_from_task_posterior(self, idx, num_samples=1, resample_z_every_n=None, eval_task=False,
-                                         add_to_enc_buffer=True):
+                                         add_to_enc_buffer=True, viz=False):
         # do not resample z if resample_z_every_n is None
         if resample_z_every_n is None:
             self.sample_z_from_posterior(idx, eval_task=eval_task)
             self.collect_data(self.policy, num_samples=num_samples, eval_task=eval_task,
-                              add_to_enc_buffer=add_to_enc_buffer)
+                              add_to_enc_buffer=add_to_enc_buffer, viz=viz)
         else:
             # collects more data in batches of resample_z_every_n until done
             while num_samples > 0:
@@ -321,13 +325,16 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
     # correctly. We also aren't using the episodes anywhere, but we should probably change this to make it gather paths
     # until we have more samples than num_samples, to make sure every episode cleanly terminates when intended.
 
-    def collect_data(self, agent, num_samples=1, eval_task=False, add_to_enc_buffer=True):
+    def collect_data(self, agent, num_samples=1, eval_task=False, add_to_enc_buffer=True, viz=False):
         '''
         collect data from current env in batch mode
         with given policy
         '''
 
         images = []
+        # if num_samples == 50:
+        #     import pdb; pdb.set_trace()
+
         for _ in range(num_samples):
             action, agent_info = self._get_action_and_info(agent, self.train_obs)
             if self.render:
@@ -336,7 +343,8 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             next_ob, raw_reward, terminal, env_info = (
                 self.env.step(action)
             )
-            images.append(next_ob)
+            if viz:
+                images.append(next_ob)
             
             reward = raw_reward
             terminal = np.array([terminal])
@@ -363,8 +371,9 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             else:
                 self.train_obs = next_ob
 
-        vis.images(np.stack(images))
-        # vis.video(np.stack(images))
+        if viz and np.random.random() < 0.1:
+            vis.images(np.stack(images))
+            # vis.video(np.stack(images))
         
         if not eval_task:
             self._n_env_steps_total += num_samples

@@ -51,9 +51,10 @@ import env as grounding_env
 
 from arguments import get_args
 
-args = get_args("--num-processes 10 --algo ppo --max-episode-length 50 --difficulty hard2 --lr 0.0001 --fixed-env 0 --dense-dist-reward full  --frame-width 64".split())
+args = get_args("--num-processes 10 --algo ppo --max-episode-length 50 --difficulty hard2 --lr 0.0001 --fixed-env 0 --dense-dist-reward clipped  --frame-width 64".split())
 
 args.difficulty = 'hard2'
+print(args)
 
 n_proc = args.num_processes
 
@@ -83,7 +84,7 @@ def experiment(variant):
     pix_dim = int(np.prod(env.observation_space.shape)) 
     obs_dim = variant['algo_params']['obs_emb_dim']
     action_dim = env.action_space.n # int(np.prod(env.action_space.shape))
-    latent_dim = 5
+    latent_dim = 32
     task_enc_output_dim = latent_dim * 2 if variant['algo_params']['use_information_bottleneck'] else latent_dim
     reward_dim = 1
 
@@ -115,13 +116,13 @@ def experiment(variant):
     )
     qf1 = FlattenMlp(
         hidden_sizes=[net_size, net_size],#, net_size],
-        input_size=obs_dim + action_dim + latent_dim,
-        output_size=1,
+        input_size=obs_dim + latent_dim,
+        output_size=action_dim,
     )
     qf2 = FlattenMlp(
         hidden_sizes=[net_size, net_size],#, net_size],
-        input_size=obs_dim + action_dim + latent_dim,
-        output_size=1,
+        input_size=obs_dim + latent_dim,
+        output_size=action_dim,
     )
     vf = FlattenMlp(
         hidden_sizes=[net_size, net_size],#, net_size],
@@ -135,17 +136,19 @@ def experiment(variant):
         action_dim=action_dim,
     )
 
+
     agent = ProtoAgent(
         latent_dim,
         [task_enc, cnn_enc, policy, qf1, qf2, vf],
         **variant['algo_params']
     )
 
-    n_train_tasks = int(variant['task_params']['n_tasks'] * 0.7)
+    n_eval_tasks = int(variant['task_params']['n_tasks'] * 0.3)
+
     algorithm = ProtoSoftActorCritic(
         env=env,
-        train_tasks=list(tasks[:-n_train_tasks]),
-        eval_tasks=list(tasks[-n_train_tasks:]),
+        train_tasks=list(tasks[:-n_eval_tasks]),
+        eval_tasks=list(tasks[-n_eval_tasks:]),
         nets=[agent, task_enc, policy, qf1, qf2, vf],
         latent_dim=latent_dim,
         **variant['algo_params']
@@ -155,6 +158,7 @@ def experiment(variant):
     algorithm.train()
 
 
+n_trials = 2
 @click.command()
 @click.argument('gpu', default=0)
 @click.option('--docker', default=0)
@@ -163,18 +167,18 @@ def main(gpu, docker):
     # noinspection PyTypeChecker
     variant = dict(
         task_params=dict(
-            n_tasks=20, # 20 works pretty well
+            n_tasks=30, # 20 works pretty well
             randomize_tasks=True,
             low_gear=False,
         ),
         algo_params=dict(
             meta_batch=10,
             num_iterations=10000,
-            num_tasks_sample=5,
-            num_steps_per_task=max_path_length,
+            num_tasks_sample=10,
+            num_steps_per_task=n_trials*max_path_length,
             num_train_steps_per_itr=500, #4000,
-            num_evals=5,
-            num_steps_per_eval=max_path_length,  # num transitions to eval on
+            num_evals=2,
+            num_steps_per_eval=n_trials*max_path_length,  # num transitions to eval on
             embedding_batch_size=256,
             embedding_mini_batch_size=256,
             batch_size=256, # to compute training grads from

@@ -30,14 +30,19 @@ class InPlacePathSampler(object):
     def shutdown_worker(self):
         pass
 
-    def obtain_samples(self, deterministic=False, num_samples=None, is_online=False):
+    def obtain_samples(self, deterministic=False, num_samples=None, num_rollouts=None, is_online=False):
         policy = MakeDeterministic(self.policy) if deterministic else self.policy
         paths = []
         n_steps_total = 0
         max_samp = self.max_samples
         if num_samples is not None:
             max_samp = num_samples
-        while n_steps_total + self.max_path_length < max_samp:
+        
+        # import pdb; pdb.set_trace()
+        while n_steps_total + self.max_path_length <= max_samp:
+            if num_rollouts is not None and num_rollouts <= len(paths):
+                break
+
             path = rollout(
                 self.env, policy, max_path_length=self.max_path_length, is_online=is_online)
             paths.append(path)

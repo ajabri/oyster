@@ -150,8 +150,21 @@ class ProtoAgent(nn.Module):
 
         # can eventually modulate the cnn encoder with the z embedding as well?
         in_ = torch.cat([obs_emb, z], dim=1)
-        action, agent_info = self.policy.get_action(in_, deterministic=deterministic)
-        action = action.astype(np.int)[0]
+        q1 = self.qf1(in_)
+
+        if deterministic:
+            action = q1.argmax(1)[0]
+        else:
+            q1 = q1.detach().cpu()
+            # import pdb; pdb.set_trace()
+            q1 = torch.nn.functional.softmax(q1, dim=1)[0].numpy()
+            action = np.random.choice(q1.size, 1, p=q1)
+            # action = q1.argmax(1)[1]
+    
+        agent_info = {}
+        # action, agent_info = self.policy.get_action(in_, deterministic=deterministic)
+        # action = action.astype(np.int)[0]
+        action = action[0]
         agent_info['obs_emb'] = obs_emb.detach().cpu().numpy()
 
         return (action, agent_info)
@@ -168,6 +181,54 @@ class ProtoAgent(nn.Module):
         return self.infer(obs, actions, next_obs, obs_enc, act_enc)
 
     def infer(self, obs, actions, next_obs, obs_enc, act_enc):
+        '''
+        compute predictions of SAC networks for update
+
+        regularize encoder with reward prediction from latent task embedding
+        '''
+
+        task_z = self.z
+
+        t, b, _ = obs.size()
+        obs = obs.view(t * b, -1)
+        actions = actions.view(t * b, -1)
+        next_obs = next_obs.view(t * b, -1)
+        task_z = [z.repeat(b, 1) for z in task_z]
+        task_z = torch.cat(task_z, dim=0)
+
+        obs_emb = obs[:, :-self.obs_emb_dim]
+        obs_emb = self.cnn_enc(obs_emb)
+
+        next_obs_emb = obs[:, :-self.obs_emb_dim]
+        next_obs_emb = self.cnn_enc(next_obs_emb)
+
+        obs, next_obs = obs_emb, next_obs_emb
+
+        # Q and V networks
+        # encoder will only get gradients from Q nets
+        q1 = self.qf1(obs, task_z)
+        q1_next = self.qf1(next_obs, task_z)
+
+        with torch.no_grad():
+            q2 = self.qf2(next_obs, task_z)
+
+        policy_outputs = q1.argmax(1)[1]
+
+        # q1 = self.qf1(obs, actions, task_z)
+        # q2 = self.qf2(obs, actions, task_z)
+        # v = self.vf(obs.detach(), task_z.detach())
+
+        # run policy, get log probs and new actions
+        # in_ = torch.cat([obs, task_z.detach()], dim=1)
+        # policy_outputs = self.policy(in_, reparameterize=self.reparam, return_log_prob=True)
+
+        # get targets for use in V and Q updates
+        # with torch.no_grad():
+        #     target_v_values = self.target_vf(next_obs, task_z)
+
+        return q1, q1_next, q2, policy_outputs, task_z
+
+    def infer2(self, obs, actions, next_obs, obs_enc, act_enc):
         '''
         compute predictions of SAC networks for update
 

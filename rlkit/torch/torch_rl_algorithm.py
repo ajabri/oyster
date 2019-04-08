@@ -4,7 +4,6 @@ from typing import Iterable
 import pickle
 
 import numpy as np
-
 from rlkit.core import logger
 from rlkit.core.eval_util import dprint
 from rlkit.core.rl_algorithm import MetaRLAlgorithm
@@ -71,10 +70,15 @@ class MetaTorchRLAlgorithm(MetaRLAlgorithm, metaclass=abc.ABCMeta):
 
         if not is_online:
             self.sample_z_from_posterior(idx, eval_task=eval_task)
+        
+        # import pdb; pdb.set_trace()
 
         dprint('task encoding ', self.policy.z)
 
-        test_paths = self.eval_sampler.obtain_samples(deterministic=deterministic, is_online=is_online)
+        test_paths = self.eval_sampler.obtain_samples(deterministic=deterministic, is_online=is_online,
+            num_rollouts=np.ceil(self.num_steps_per_task / self.max_path_length))
+
+        # import pdb; pdb.set_trace()
         if self.sparse_rewards:
             for p in test_paths:
                 p['rewards'] = ptu.sparsify_rewards(p['rewards'])
@@ -166,14 +170,18 @@ class MetaTorchRLAlgorithm(MetaRLAlgorithm, metaclass=abc.ABCMeta):
         ### train tasks
         dprint('evaluating on {} train tasks'.format(len(self.train_tasks)))
         train_avg_returns = []
+        train_avg_succ = []
         for idx in self.train_tasks:
             dprint('task {} encoder RB size'.format(idx), self.enc_replay_buffer.task_buffers[idx]._size)
             paths = self.collect_paths(idx, epoch, eval_task=False)
+            # import pdb; pdb.set_trace()
             train_avg_returns.append(eval_util.get_average_returns(paths))
+            train_avg_succ.append([sum([j['succ'] for j in i['env_infos']]) for i in paths])
 
         ### test tasks
         dprint('evaluating on {} test tasks'.format(len(self.eval_tasks)))
         test_avg_returns = []
+        test_avg_succ = []
         # This is calculating the embedding online, because every iteration
         # we clear the encoding buffer for the test tasks.
         for idx in self.eval_tasks:
@@ -203,6 +211,7 @@ class MetaTorchRLAlgorithm(MetaRLAlgorithm, metaclass=abc.ABCMeta):
             test_paths = self.collect_paths(idx, epoch, eval_task=True)
 
             test_avg_returns.append(eval_util.get_average_returns(test_paths))
+            test_avg_succ.append([sum([j['succ'] for j in i['env_infos']]) for i in test_paths])
 
             if self.use_information_bottleneck:
                 z_mean = np.mean(np.abs(ptu.get_numpy(self.policy.z_dists[0].mean)))
@@ -217,8 +226,15 @@ class MetaTorchRLAlgorithm(MetaRLAlgorithm, metaclass=abc.ABCMeta):
 
         avg_train_return = np.mean(train_avg_returns)
         avg_test_return = np.mean(test_avg_returns)
+        avg_train_succ = np.mean(train_avg_succ, axis=0)
+        avg_test_succ = np.mean(test_avg_succ, axis=0)
+
         self.eval_statistics['AverageReturn_all_train_tasks'] = avg_train_return
         self.eval_statistics['AverageReturn_all_test_tasks'] = avg_test_return
+        for i,s in enumerate(avg_train_succ):
+            self.eval_statistics['AverageSucc_all_train_tasks_%s' % i] = s
+        for i,s in enumerate(avg_test_succ):
+            self.eval_statistics['AverageSucc_all_test_tasks_%s' % i] = s
 
         for key, value in self.eval_statistics.items():
             logger.record_tabular(key, value)
