@@ -12,9 +12,6 @@ identity = Identity()
 
 import numpy as np
 
-
-
-
 class CNN(PyTorchModule):
     def __init__(
             self,
@@ -81,6 +78,7 @@ class CNN(PyTorchModule):
         for conv_layer in self.conv_layers:
             test_mat = conv_layer(test_mat)
             self.conv_norm_layers.append(nn.BatchNorm2d(test_mat.shape[1]))
+            print(conv_layer, ' out shape ', test_mat.shape)
 
         fc_input_size = int(np.prod(test_mat.shape))
         # used only for injecting input directly into fc layers

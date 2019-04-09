@@ -48,6 +48,8 @@ class ProtoAgent(nn.Module):
         self.det_z = False
         self.obs_emb_dim = kwargs['obs_emb_dim']
 
+        self.n_updates = 0
+
         # initialize task embedding to zero
         # (task, latent dim)
         self.register_buffer('z', torch.zeros(1, latent_dim))
@@ -144,28 +146,45 @@ class ProtoAgent(nn.Module):
         ''' sample action from the policy, conditioned on the task embedding '''
         z = self.z
         obs = ptu.from_numpy(obs[None])
+        self.n_updates += 1
 
-        obs_emb = self.cnn_enc(obs.view(obs.shape[0], -1))
-        # import pdb; pdb.set_trace()
-
-        # can eventually modulate the cnn encoder with the z embedding as well?
-        in_ = torch.cat([obs_emb, z], dim=1)
-        q1 = self.qf1(in_)
-
-        if deterministic:
-            action = q1.argmax(1)[0]
-        else:
-            q1 = q1.detach().cpu()
+        with torch.no_grad():
+            obs_emb = self.cnn_enc(obs.view(obs.shape[0], -1))
             # import pdb; pdb.set_trace()
-            q1 = torch.nn.functional.softmax(q1, dim=1)[0].numpy()
-            action = np.random.choice(q1.size, 1, p=q1)
-            # action = q1.argmax(1)[1]
-    
-        agent_info = {}
-        # action, agent_info = self.policy.get_action(in_, deterministic=deterministic)
-        # action = action.astype(np.int)[0]
-        action = action[0]
-        agent_info['obs_emb'] = obs_emb.detach().cpu().numpy()
+
+            # can eventually modulate the cnn encoder with the z embedding as well?
+            in_ = torch.cat([obs_emb, z], dim=1)
+            q1 = self.qf1(in_)
+
+            if deterministic:
+                action = q1.argmax(1)[0]
+            else:
+                # eps = (1/ (np.exp(self.n_updates**0.1)))
+                # eps = eps * 0.8 + 0.1
+                eps, N, H = 1, self.n_updates, 100000
+                # temp = max((H - N), 0) / H * 10 
+                # if np.random.random() < 0.1:
+                #     print("TEMP", N, temp)
+                temp = 1
+
+                if np.random.random() <= eps:
+                    # boltzmann
+                    q1 = q1.cpu()
+                    q1 = torch.nn.functional.softmax(q1/temp, dim=1)[0].numpy()
+                    action = np.random.choice(q1.size, 1, p=q1)
+
+                    # random
+                    # action = np.random.choice(q1.shape[1], 1)#, p=q1)
+                    # import pdb; pdb.set_trace()
+                else:
+                    action = q1.argmax(1)[0]
+                    # import pdb; pdb.set_trace()
+        
+            agent_info = {}
+            # action, agent_info = self.policy.get_action(in_, deterministic=deterministic)
+            # action = action.astype(np.int)[0]
+            action = action[0]
+            agent_info['obs_emb'] = obs_emb.detach().cpu().numpy()
 
         return (action, agent_info)
 

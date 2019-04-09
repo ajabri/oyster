@@ -226,6 +226,7 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
                                                           num_samples=self.num_steps_per_task,
                                                           add_to_enc_buffer=False,
                                                           viz=True)
+
                 elif self.train_embedding_source == 'online_on_policy_trajectories':
                     # sample from prior, then sample more from the posterior
                     # embeddings computed from both prior and posterior data
@@ -335,6 +336,9 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         # if num_samples == 50:
         #     import pdb; pdb.set_trace()
 
+        env_time = self.env.time
+        rews = []
+        terms = []
         for _ in range(num_samples):
             action, agent_info = self._get_action_and_info(agent, self.train_obs)
             if self.render:
@@ -347,6 +351,9 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
                 images.append(next_ob)
             
             reward = raw_reward
+            rews += [reward]
+            terms += [terminal]
+
             terminal = np.array([terminal])
             reward = np.array([reward])
             self._handle_step(
@@ -371,8 +378,9 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             else:
                 self.train_obs = next_ob
 
-        if viz and np.random.random() < 0.1:
-            vis.images(np.stack(images))
+        if viz and np.random.random() < 0.3:
+            vis.images(np.stack(images)[:, -3:])
+            vis.line(np.array([rews, terms]), opts=dict(width=400, height=320))
             # vis.video(np.stack(images))
         
         if not eval_task:
