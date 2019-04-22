@@ -81,6 +81,8 @@ class CNN(PyTorchModule):
             print(conv_layer, ' out shape ', test_mat.shape)
 
         fc_input_size = int(np.prod(test_mat.shape))
+        print('Hidden dim ', fc_input_size)
+        
         # used only for injecting input directly into fc layers
         fc_input_size += added_fc_input_size
 

@@ -12,9 +12,13 @@ from rlkit.data_management.path_builder import PathBuilder
 from rlkit.policies.base import ExplorationPolicy
 from rlkit.samplers.in_place import InPlacePathSampler
 
+import memory_profiler
+from memory_profiler import profile
+
 import visdom
 vis = visdom.Visdom(port=8095, env='sac')
 vis.close()
+
 class MetaRLAlgorithm(metaclass=abc.ABCMeta):
     def __init__(
             self,
@@ -87,7 +91,7 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         self.embedding_mini_batch_size = embedding_mini_batch_size
         self.max_path_length = max_path_length
         self.discount = discount
-        self.replay_buffer_size = min(int(replay_buffer_size/(len(train_tasks)+len(eval_tasks))), 10000)
+        self.replay_buffer_size = min(int(replay_buffer_size/(len(train_tasks))), 1000)
         self.reward_scale = reward_scale
         self.train_embedding_source = train_embedding_source
         self.eval_embedding_source = eval_embedding_source # TODO: add options for computing embeddings on train tasks too
@@ -240,7 +244,7 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             # Sample train tasks and compute gradient updates on parameters.
             for train_step in range(self.num_train_steps_per_itr):
                 indices = np.random.choice(self.train_tasks, self.meta_batch)
-                self._do_training(indices)
+                self._do_training(indices, train_step)
                 self._n_train_steps_total += 1
             gt.stamp('train')
 
@@ -306,7 +310,8 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
                                                       num_samples=min(resample_z_every_n, num_samples),
                                                       resample_z_every_n=None,
                                                       eval_task=eval_task,
-                                                      add_to_enc_buffer=add_to_enc_buffer)
+                                                      add_to_enc_buffer=add_to_enc_buffer,
+                                                      viz=viz)
                 num_samples -= resample_z_every_n
 
     # split number of prior and posterior samples
@@ -315,18 +320,21 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
                                               resample_z_every_n=self.max_path_length,
                                               eval_task=eval_task,
                                               add_to_enc_buffer=True)
+        self.env.reset_task(idx)
         self.collect_data_from_task_posterior(idx=idx,
                                               num_samples=num_samples,
                                               resample_z_every_n=self.max_path_length,
                                               eval_task=eval_task,
-                                              add_to_enc_buffer=add_to_enc_buffer)
+                                              add_to_enc_buffer=add_to_enc_buffer,
+                                              viz=True)
 
 
     # TODO: since switching tasks now resets the environment, we are not correctly handling episodes terminating
     # correctly. We also aren't using the episodes anywhere, but we should probably change this to make it gather paths
     # until we have more samples than num_samples, to make sure every episode cleanly terminates when intended.
 
-    def collect_data(self, agent, num_samples=1, eval_task=False, add_to_enc_buffer=True, viz=False):
+    # @profile
+    def collect_data(self, agent, num_samples=1, max_resets=None, eval_task=False, add_to_enc_buffer=True, viz=False):
         '''
         collect data from current env in batch mode
         with given policy
@@ -339,6 +347,8 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         env_time = self.env.time
         rews = []
         terms = []
+        n_resets = 0
+
         for _ in range(num_samples):
             action, agent_info = self._get_action_and_info(agent, self.train_obs)
             if self.render:
@@ -349,6 +359,7 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             )
             if viz:
                 images.append(next_ob)
+                # vis.image(next_ob[-1])
             
             reward = raw_reward
             rews += [reward]
@@ -359,12 +370,12 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             self._handle_step(
                 self.task_idx,
                 np.concatenate(
-                    [self.train_obs.reshape(1, -1), agent_info['obs_emb']], axis=-1
+                    [self.train_obs.flatten()[None], agent_info['obs_emb']], axis=-1
                 ),
                 action,
                 reward,
                 np.concatenate(
-                    [next_ob.reshape(1, -1), torch.zeros(agent_info['obs_emb'].shape)], axis=-1
+                    [next_ob.flatten()[None], torch.zeros(agent_info['obs_emb'].shape)], axis=-1
                 ),
                 terminal,
                 eval_task=eval_task,
@@ -372,15 +383,30 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
                 agent_info=agent_info,
                 env_info=env_info,
             )
+
+            # TODO USE masking here to handle the terminal episodes
+            # print(len(self._current_path_builder))
             if terminal or len(self._current_path_builder) >= self.max_path_length:
                 self._handle_rollout_ending(eval_task=eval_task)
                 self.train_obs = self._start_new_rollout()
+                n_resets += 1
+
+                if _ + self.max_path_length > num_samples - 1:
+                    break
+                if max_resets is not None and n_resets > max_resets:
+                    break
+
             else:
+                # print((next_ob - self.train_obs).sum())
+                # self.train_obs = None
                 self.train_obs = next_ob
+            
 
         if viz and np.random.random() < 0.3:
-            vis.images(np.stack(images)[:, -3:])
-            vis.line(np.array([rews, terms]), opts=dict(width=400, height=320))
+            # import pdb; pdb.set_trace()
+            vis.images(np.stack(images)[:, -1:])
+            vis.line(np.array([rews, terms]).T, opts=dict(width=400, height=320))
+            vis.text('', opts=dict(width=10000, height=5))
             # vis.video(np.stack(images))
         
         if not eval_task:
@@ -444,9 +470,11 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
 
         :return:
         """
+        # import pdb; pdb.set_trace()
         return (
-            len(self._exploration_paths) > 0
-            and self.replay_buffer.num_steps_can_sample(self.task_idx) >= self.batch_size
+            # len(self._exploration_paths) > 0
+            # and 
+            self.replay_buffer.num_steps_can_sample(self.task_idx) >= self.batch_size
         )
 
     def _can_train(self):
@@ -587,10 +615,10 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             self.enc_replay_buffer.terminate_episode(self.task_idx)
 
         self._n_rollouts_total += 1
-        if len(self._current_path_builder) > 0:
-            self._exploration_paths.append(
-                self._current_path_builder.get_all_stacked()
-            )
+        if len(self._current_path_builder) > 0:# and False:
+            # self._exploration_paths.append(
+            #     self._current_path_builder.get_all_stacked()
+            # )
             self._current_path_builder = PathBuilder()
 
     def get_epoch_snapshot(self, epoch):

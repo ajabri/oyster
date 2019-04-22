@@ -32,7 +32,7 @@ def rollout(env, agent, max_path_length=np.inf, animated=False, is_online=False)
     o = env.reset()
     if isinstance(o, tuple):
         o = o[0]
-        
+
     next_o = None
     path_length = 0
     if animated:
@@ -41,7 +41,7 @@ def rollout(env, agent, max_path_length=np.inf, animated=False, is_online=False)
         a, agent_info = agent.get_action(o)
         next_o, r, d, env_info = env.step(a)
         if is_online:
-            agent.update_context([o, a, r, next_o, d])
+            agent.update_context([agent_info['obs_emb'][0], np.eye(3)[a], r, next_o, d])
         observations.append(o)
         rewards.append(r)
         terminals.append(d)

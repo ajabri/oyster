@@ -11,6 +11,20 @@ from rlkit.torch import pytorch_util as ptu
 from rlkit.torch.core import PyTorchModule, np_ify, torch_ify
 from rlkit.core import logger, eval_util
 
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+class PolicyDataset(Dataset):
+    def __init__(self, policy, eval_task=False):
+        self.policy = policy
+        self.eval_task = eval_task
+
+    def __getitem__(self, idx):
+        return self.policy.collect_paths(idx, 0, self.eval_task)
+
+    def __len__(self):
+        return len(self.policy.env.tasks)
+
 
 class MetaTorchRLAlgorithm(MetaRLAlgorithm, metaclass=abc.ABCMeta):
     def __init__(self, *args, render_eval_paths=False, plotter=None, dump_eval_paths=False, output_dir=None, recurrent=False, **kwargs):
@@ -38,25 +52,44 @@ class MetaTorchRLAlgorithm(MetaRLAlgorithm, metaclass=abc.ABCMeta):
         for net in self.networks:
             net.to(device)
 
-    ##### Data handling #####
-    def get_batch(self, idx=None):
+    # def _get_batch(self, idx, buffer, batch_size, eval_task=False, numpify=True):
+    #     ''' get a batch from replay buffer for input into net '''
+    #     batch = buffer.random_batch(idx, batch_size)
+    #     return np_to_pytorch_batch(batch) if numpify else batch        
+
+    # def _get_encoding_batch(self, idx=None, eval_task=False, numpify=True):
+    #     ''' get a batch from the separate encoding replay buffer '''
+    #     # n.b. if eval is online, training should sample trajectories rather than unordered batches to better match statistics
+    #     is_online = (self.eval_embedding_source == 'online')
+    #     if idx is None:
+    #         idx = self.task_idx
+
+    #     if eval_task:
+    #         batch = self.eval_enc_replay_buffer.random_batch(idx, self.embedding_batch_size, trajs=is_online)
+    #     else:
+    #         batch = self.enc_replay_buffer.random_batch(idx, self.embedding_batch_size, trajs=is_online)
+    #     return np_to_pytorch_batch(batch) if numpify else batch
+
+    # ##### Data handling #####
+    def get_batch(self, idx=None, numpify=True):
         ''' get a batch from replay buffer for input into net '''
-        if idx is None:
+        if idx is None: 
             idx = self.task_idx
         batch = self.replay_buffer.random_batch(idx, self.batch_size)
-        return np_to_pytorch_batch(batch)
+        return np_to_pytorch_batch(batch) if numpify else batch
 
-    def get_encoding_batch(self, idx=None, eval_task=False):
+    def get_encoding_batch(self, idx=None, eval_task=False, numpify=True):
         ''' get a batch from the separate encoding replay buffer '''
         # n.b. if eval is online, training should sample trajectories rather than unordered batches to better match statistics
         is_online = (self.eval_embedding_source == 'online')
         if idx is None:
             idx = self.task_idx
+
         if eval_task:
             batch = self.eval_enc_replay_buffer.random_batch(idx, self.embedding_batch_size, trajs=is_online)
         else:
             batch = self.enc_replay_buffer.random_batch(idx, self.embedding_batch_size, trajs=is_online)
-        return np_to_pytorch_batch(batch)
+        return np_to_pytorch_batch(batch) if numpify else batch
 
     ##### Eval stuff #####
     def obtain_eval_paths(self, idx, eval_task=False, deterministic=False):
@@ -128,10 +161,10 @@ class MetaTorchRLAlgorithm(MetaRLAlgorithm, metaclass=abc.ABCMeta):
         self.task_idx = idx
         dprint('Task:', idx)
         self.env.reset_task(idx)
-        if eval_task:
-            num_evals = self.num_evals
-        else: 
-            num_evals = 1
+        # if eval_task:
+        #     num_evals = self.num_evals
+        # else: 
+        num_evals = 1
 
         paths = []
         for _ in range(num_evals):
@@ -167,24 +200,61 @@ class MetaTorchRLAlgorithm(MetaRLAlgorithm, metaclass=abc.ABCMeta):
         statistics.update(self.eval_statistics)
         self.eval_statistics = statistics
 
+        # old_device = ptu.device
+        # ptu.device = torch.device('cpu')
+        # self.policy.cnn_enc.to(ptu.device)
+        # self.policy.task_enc.to(ptu.device)
+        # self.policy.qf1.to(ptu.device)
+
+        # self.policy_dataset = PolicyDataset(self, eval_task=False)
+
+
+        # self.policy_loader = iter(torch.utils.data.DataLoader(self.policy_dataset, batch_size=1, 
+        #         shuffle=False, pin_memory=True, sampler=None, batch_sampler=None, num_workers=10,
+        #         worker_init_fn=None, collate_fn=lambda x: x))
+
+        import time
+        # for i in range(10):
+        #     t0 = time.time()
+        #     paths = self.policy_loader.next()
+        #     print((time.time() - t0))
+
+        # # import pdb; pdb.set_trace()
+
         ### train tasks
         dprint('evaluating on {} train tasks'.format(len(self.train_tasks)))
         train_avg_returns = []
         train_avg_succ = []
+        train_avg_len = []
         for idx in self.train_tasks:
             dprint('task {} encoder RB size'.format(idx), self.enc_replay_buffer.task_buffers[idx]._size)
             paths = self.collect_paths(idx, epoch, eval_task=False)
+
+            t0 = time.time()
+            # paths = self.policy_loader.next()[0]
             # import pdb; pdb.set_trace()
             train_avg_returns.append(eval_util.get_average_returns(paths))
             train_avg_succ.append([sum([j['succ'] for j in i['env_infos']]) for i in paths])
+            train_avg_len.append([len(i['env_infos']) for i in paths])
+            print((time.time() - t0))
 
-        ### test tasks
+        # import pdb; pdb.set_trace()
+
+        # ptu.device = old_device
+        # self.policy.cnn_enc.to(ptu.device)
+        # self.policy.task_enc.to(ptu.device)
+        # self.policy.qf1.to(ptu.device)
+
+        ## test tasks
         dprint('evaluating on {} test tasks'.format(len(self.eval_tasks)))
         test_avg_returns = []
         test_avg_succ = []
+        test_avg_len = []
         # This is calculating the embedding online, because every iteration
         # we clear the encoding buffer for the test tasks.
-        for idx in self.eval_tasks:
+
+
+        for idx in np.random.choice(self.eval_tasks, self.num_evals, replace=False):
             print('eval task', idx)
             self.task_idx = idx
             self.env.reset_task(idx)
@@ -212,6 +282,7 @@ class MetaTorchRLAlgorithm(MetaRLAlgorithm, metaclass=abc.ABCMeta):
 
             test_avg_returns.append(eval_util.get_average_returns(test_paths))
             test_avg_succ.append([sum([j['succ'] for j in i['env_infos']]) for i in test_paths])
+            test_avg_len.append([len(i['env_infos']) for i in test_paths])
 
             if self.use_information_bottleneck:
                 z_mean = np.mean(np.abs(ptu.get_numpy(self.policy.z_dists[0].mean)))
@@ -223,18 +294,25 @@ class MetaTorchRLAlgorithm(MetaRLAlgorithm, metaclass=abc.ABCMeta):
             if hasattr(self.env, "log_diagnostics"):
                 self.env.log_diagnostics(test_paths)
 
-
         avg_train_return = np.mean(train_avg_returns)
         avg_test_return = np.mean(test_avg_returns)
         avg_train_succ = np.mean(train_avg_succ, axis=0)
         avg_test_succ = np.mean(test_avg_succ, axis=0)
-
+        avg_train_len = np.mean(train_avg_len, axis=0)
+        avg_test_len = np.mean(test_avg_len, axis=0)
+        
         self.eval_statistics['AverageReturn_all_train_tasks'] = avg_train_return
         self.eval_statistics['AverageReturn_all_test_tasks'] = avg_test_return
+
         for i,s in enumerate(avg_train_succ):
-            self.eval_statistics['AverageSucc_all_train_tasks_%s' % i] = s
+            self.eval_statistics['Succ_train_tasks_%s' % i] = s
         for i,s in enumerate(avg_test_succ):
-            self.eval_statistics['AverageSucc_all_test_tasks_%s' % i] = s
+            self.eval_statistics['Succ_test_tasks_%s' % i] = s
+
+        for i,s in enumerate(avg_train_len):
+            self.eval_statistics['Len__train_tasks_%s' % i] = s
+        for i,s in enumerate(avg_test_len):
+            self.eval_statistics['Len_test_tasks_%s' % i] = s
 
         for key, value in self.eval_statistics.items():
             logger.record_tabular(key, value)

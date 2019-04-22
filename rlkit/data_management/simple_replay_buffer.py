@@ -1,7 +1,8 @@
 import numpy as np
 
 from rlkit.data_management.replay_buffer import ReplayBuffer
-
+import memory_profiler
+from memory_profiler import profile
 
 class SimpleReplayBuffer(ReplayBuffer):
     def __init__(
@@ -23,13 +24,14 @@ class SimpleReplayBuffer(ReplayBuffer):
         self._terminals = np.zeros((max_replay_buffer_size, 1), dtype='uint8')
         self.clear()
 
+    # @profile
     def add_sample(self, observation, action, reward, terminal,
                    next_observation, **kwargs):
-        self._observations[self._top] = observation
-        self._actions[self._top] = action
-        self._rewards[self._top] = reward
-        self._terminals[self._top] = terminal
-        self._next_obs[self._top] = next_observation
+        np.copyto(self._observations[self._top], observation)
+        np.copyto(self._actions[self._top], action)
+        np.copyto(self._rewards[self._top], reward)
+        np.copyto(self._terminals[self._top], terminal)
+        np.copyto(self._next_obs[self._top], next_observation)
         self._advance()
 
     def terminate_episode(self):
@@ -70,11 +72,11 @@ class SimpleReplayBuffer(ReplayBuffer):
         ''' batch of trajectories '''
         # take random trajectories until we have enough
         # TODO hack to not deal with wrapping episodes, just don't take the last one
-        shuffled_starts = np.random.permutation(self._episode_starts[:-1])
+        # shuffled_starts = 
         i = 0
         indices = []
         while len(indices) < batch_size:
-            start = shuffled_starts[i]
+            start = np.random.choice(self._episode_starts[:-1])
             pos_idx = self._episode_starts.index(start)
             indices += list(range(start, self._episode_starts[pos_idx + 1]))
             i += 1

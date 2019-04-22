@@ -50,6 +50,7 @@ sys.path.append('/home/jabreezus/clones2/meta-vizdoom/ppo')
 import arguments
 import env as grounding_env
 from arguments import get_args
+from subproc_vec_env import SubprocVecEnv
 args = get_args("--num-processes 10 --algo ppo --max-episode-length 50 --difficulty hard2 --lr 0.0001 --fixed-env 0 --dense-dist-reward clipped  --frame-width 64".split())
 # args.difficulty = 'hard2'
 # n_proc = args.num_processes
@@ -63,19 +64,28 @@ def datetimestamp(divider=''):
 
 def experiment(variant):
 
+    args.grayscale = variant['grayscale']
     def make_my_env(args, rank):
         def thunk():
             _env = grounding_env.GroundingEnv(args, args.seed + rank,
                 img_encoder=None, fixed=False, manual_set_task=True,
                 n_stack=variant['n_stack'])
             _env.game_init()
-            _env.tasks = _env.sample_tasks(variant['task_params']['n_tasks'])
+            _env.tasks = _env.sample_tasks(variant['task_params']['n_tasks'], variants=variant['all_tasks'])
             return _env    
         return thunk
 
     task_params = variant['task_params']
     # env = NormalizedBoxEnv(AntGoalEnv(n_tasks=task_params['n_tasks'], use_low_gear_ratio=task_params['low_gear']))
     env = make_my_env(args, 0)()
+    # import time
+
+    # def make_envs():
+    #     t0 = time.time()
+    #     envs = SubprocVecEnv([make_my_env(args, i) for i in range(10)])
+    #     print('TIMING', time.time() - t0)
+
+    # import pdb; pdb.set_trace()
 
     ptu.set_gpu_mode(variant['use_gpu'], variant['gpu_id'])
 
@@ -84,7 +94,7 @@ def experiment(variant):
     pix_dim = int(np.prod(env.observation_space.shape)) 
     obs_dim = variant['algo_params']['obs_emb_dim']
     action_dim = env.action_space.n # int(np.prod(env.action_space.shape))
-    latent_dim = 10
+    latent_dim = 5
     task_enc_output_dim = latent_dim * 2 if variant['algo_params']['use_information_bottleneck'] else latent_dim
     reward_dim = 1
 
@@ -92,11 +102,13 @@ def experiment(variant):
     # start with linear task encoding
     recurrent = variant['algo_params']['recurrent']
     encoder_model = RecurrentEncoder if recurrent else MlpEncoder
+    nchan = 1 if variant['grayscale'] else 3
+    n_layers = variant['n_layers']
 
     cnn_enc = CNNEncoder(
-        64, 64, 3*variant['n_stack'], obs_dim,
+        64, 64, nchan*variant['n_stack'], obs_dim,
         [8, 4, 3, 3],  #kernels
-        [64, 64, 64, 64], #channels
+        [256, 64, 64, 64], #channels
         [2, 2, 2, 2], # strides
         [1, 1, 1, 1], # padding
         # hidden_sizes=[256],
@@ -110,32 +122,31 @@ def experiment(variant):
     )
 
     task_enc = encoder_model(
-            hidden_sizes=[200, 200],# 200], # deeper net + higher dim space generalize better
+            hidden_sizes=[200] * n_layers, # deeper net + higher dim space generalize better
             input_size=obs_dim + action_dim + reward_dim,
             output_size=task_enc_output_dim,
     )
     qf1 = FlattenMlp(
-        hidden_sizes=[net_size, net_size],#, net_size],
+        hidden_sizes=[net_size] * n_layers,
         input_size=obs_dim + latent_dim,
         output_size=action_dim,
     )
     qf2 = FlattenMlp(
-        hidden_sizes=[net_size, net_size],#, net_size],
+        hidden_sizes=[net_size] * n_layers,
         input_size=obs_dim + latent_dim,
         output_size=action_dim,
     )
     vf = FlattenMlp(
-        hidden_sizes=[net_size, net_size],#, net_size],
+        hidden_sizes=[net_size] * n_layers,#, net_size],
         input_size=obs_dim + latent_dim,
         output_size=1,
     )
     policy = TanhGaussianPolicy(
-        hidden_sizes=[net_size, net_size],# net_size],
+        hidden_sizes=[net_size] * n_layers,# net_size],
         obs_dim=obs_dim + latent_dim,
         latent_dim=latent_dim,
         action_dim=action_dim,
     )
-
 
     agent = ProtoAgent(
         latent_dim,
@@ -158,50 +169,77 @@ def experiment(variant):
     algorithm.train()
 
 
-n_trials = 2
 @click.command()
 @click.argument('gpu', default=0)
 @click.argument('exp_id', default='vizdoom')
 @click.option('--docker', default=0)
 def main(gpu, exp_id, docker):
     max_path_length = 50
+    lr = 3E-4
+
+    n_trials = 5
+    bsz = (256//2) 
+
+    small = False
+    if small: # debugging
+        n_tasks=10
+        meta_batch=2
+        num_tasks_sample=5
+        num_train_steps_per_itr=10
+        num_evals=3
+    else:
+        bsz = bsz // 2
+        n_tasks=100
+        meta_batch=20
+        num_tasks_sample=40
+        num_train_steps_per_itr=200
+        num_evals=10
+
     # noinspection PyTypeChecker
     variant = dict(
         task_params=dict(
-            n_tasks=10, # 20 works pretty well
+            n_tasks=n_tasks, # 20 works pretty well
             randomize_tasks=True,
             low_gear=False,
         ),
         algo_params=dict(
-            meta_batch=10,
+            meta_batch=meta_batch,
             num_iterations=10000,
-            num_tasks_sample=10,
+            num_tasks_sample=num_tasks_sample,
             num_steps_per_task=n_trials*max_path_length,
-            num_train_steps_per_itr=100, #4000,
-            num_evals=2,
+            num_train_steps_per_itr=num_train_steps_per_itr, #4000,
+            num_evals=num_evals,
             num_steps_per_eval=n_trials*max_path_length,  # num transitions to eval on
-            embedding_batch_size=256,
-            embedding_mini_batch_size=256,
-            batch_size=256, # to compute training grads from
+            embedding_batch_size=bsz*4,
+            embedding_mini_batch_size=bsz,
+            batch_size=bsz, # to compute training grads from
             obs_emb_dim=256,
             max_path_length=max_path_length,
-            discount=0.999,
-            soft_target_tau=0.005,
-            policy_lr=3E-4,
-            qf_lr=3E-4,
-            vf_lr=3E-4,
-            context_lr=3e-4,
-            reward_scale=1.,
+            discount=0.99,
+            
+            soft_target_tau=0.001,
+            target_update_period=0.001,
+
+            policy_lr=lr,
+            qf_lr=lr,
+            vf_lr=lr,
+            context_lr=lr,
+            reward_scale=5.,
             sparse_rewards=False,
             reparameterize=True,
-            kl_lambda=0.1,
+            kl_lambda=0.5,
             use_information_bottleneck=True,  # only supports False for now
             eval_embedding_source='online_exploration_trajectories',
             train_embedding_source='online_exploration_trajectories',
+            # eval_embedding_source='online_exploration_trajectories',
+            # train_embedding_source='online_exploration_trajectories',
             recurrent=False, # recurrent or averaging encoder
             dump_eval_paths=False,
         ),
-        n_stack=2,
+        n_layers=2,
+        all_tasks=True,
+        n_stack=4,
+        grayscale=True,
         net_size=300,
         use_gpu=True,
         gpu_id=gpu,

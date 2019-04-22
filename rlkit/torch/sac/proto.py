@@ -4,10 +4,14 @@ import torch
 from torch import Tensor
 from torch import nn as nn
 import torch.nn.functional as F
+import math
 
 import rlkit.torch.pytorch_util as ptu
 from rlkit.torch.core import np_ify, torch_ify
 
+EPS_START = 0.9
+EPS_END = 0.05
+EPS_DECAY = 1000000
 
 def _product_of_gaussians(mus, sigmas_squared):
     '''
@@ -48,6 +52,7 @@ class ProtoAgent(nn.Module):
         self.det_z = False
         self.obs_emb_dim = kwargs['obs_emb_dim']
 
+        self.q1_buff = []
         self.n_updates = 0
 
         # initialize task embedding to zero
@@ -81,10 +86,12 @@ class ProtoAgent(nn.Module):
         if self.sparse_rewards:
             r = ptu.sparsify_rewards(r)
         o = ptu.from_numpy(o[None, None, ...])
-        a = ptu.from_numpy(o[None, None, ...])
+        a = ptu.from_numpy(a[None, None, ...])
         r = ptu.from_numpy(np.array([r])[None, None, ...])
         # TODO: we can make this a bit more efficient by simply storing the natural params of the current posterior and add the new sample to update
         # then in the info bottleneck, we compute the the normal after computing the mean/variance from the natural params stored
+        # import pdb; pdb.set_trace()
+        # o = o[:, :-self.obs_emb_dim]
         data = torch.cat([o, a, r], dim=2)
         self.update_z(data)
 
@@ -134,19 +141,20 @@ class ProtoAgent(nn.Module):
         if self.recurrent:
             z = new_z
         else:
+            if self.use_ib:
+                new_z = self.information_bottleneck(new_z)
             new_z = new_z[0] # batch x feat
             num_updates = new_z.size(0)
             for i in range(num_updates):
                 num_z += 1
                 z += (new_z[i][None] - z) / num_z
-        if self.use_ib:
-            z = self.information_bottleneck(z)
+        
+        self.z = z
 
     def get_action(self, obs, deterministic=False):
         ''' sample action from the policy, conditioned on the task embedding '''
         z = self.z
         obs = ptu.from_numpy(obs[None])
-        self.n_updates += 1
 
         with torch.no_grad():
             obs_emb = self.cnn_enc(obs.view(obs.shape[0], -1))
@@ -155,26 +163,39 @@ class ProtoAgent(nn.Module):
             # can eventually modulate the cnn encoder with the z embedding as well?
             in_ = torch.cat([obs_emb, z], dim=1)
             q1 = self.qf1(in_)
-
+            # print(obs.norm().item(), obs_emb.norm().item(),
+            #     in_.norm().item(), ["%0.5f" % i for i in q1.tolist()[0]])
+            
             if deterministic:
                 action = q1.argmax(1)[0]
             else:
                 # eps = (1/ (np.exp(self.n_updates**0.1)))
                 # eps = eps * 0.8 + 0.1
-                eps, N, H = 1, self.n_updates, 100000
+                eps, N = 1, self.n_updates
+                self.n_updates += 1
+
+                eps = EPS_END + (EPS_START - EPS_END) * \
+                    math.exp(-1. * N / EPS_DECAY)
+
                 # temp = max((H - N), 0) / H * 10 
-                # if np.random.random() < 0.1:
-                #     print("TEMP", N, temp)
-                temp = 1
+                if np.random.random() < 0.0001:
+                    print("eps", N, eps)
 
                 if np.random.random() <= eps:
                     # boltzmann
-                    q1 = q1.cpu()
-                    q1 = torch.nn.functional.softmax(q1/temp, dim=1)[0].numpy()
+                    q1_org = q1.cpu()
+                    q1 = torch.nn.functional.softmax(q1_org, dim=1)[0].numpy()
                     action = np.random.choice(q1.size, 1, p=q1)
 
+                    # print((np.log(q1) * q1).sum())
+                    self.q1_buff += [(np.log(q1) * q1).sum().item()]
+
+                    if len(self.q1_buff) > 100:
+                        print('Cum Entropy', sum(self.q1_buff) / len(self.q1_buff))
+                        self.q1_buff = []
+
                     # random
-                    # action = np.random.choice(q1.shape[1], 1)#, p=q1)
+                    # action = np.random.choice(q1_org.shape[1], 1)#, p=q1)
                     # import pdb; pdb.set_trace()
                 else:
                     action = q1.argmax(1)[0]
@@ -218,7 +239,7 @@ class ProtoAgent(nn.Module):
         obs_emb = obs[:, :-self.obs_emb_dim]
         obs_emb = self.cnn_enc(obs_emb)
 
-        next_obs_emb = obs[:, :-self.obs_emb_dim]
+        next_obs_emb = next_obs[:, :-self.obs_emb_dim]
         next_obs_emb = self.cnn_enc(next_obs_emb)
 
         obs, next_obs = obs_emb, next_obs_emb
